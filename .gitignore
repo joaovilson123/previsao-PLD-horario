@@ -1,0 +1,14 @@
+# Dados brutos e processados
+data/raw/*.csv
+data/processed/*
+
+# Arquivos temporários do Python e Ambientes Virtuais
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Configurações do ambiente de desenvolvimento (IDE)
+.vscode/
+.idea/
