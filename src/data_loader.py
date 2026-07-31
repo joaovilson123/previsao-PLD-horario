@@ -1,4 +1,8 @@
 import pandas as pd
+from pathlib import Path
+# Encontra a pasta raiz do projeto (Sobe 1 nível a partir do diretório do próprio script)
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_DIR = BASE_DIR / "data" / "raw"
 
 
 def limpar_numeros(series: pd.Series) -> pd.Series:

@@ -2,6 +2,9 @@ from src.data_loader import carregar_e_unificar_dados
 from src.features import criar_features_temporais
 from src.model import preparar_dados_e_treinar
 
+
+
+
 if __name__ == "__main__":
     print("1. Carregando dados...")
     df_raw = carregar_e_unificar_dados()
