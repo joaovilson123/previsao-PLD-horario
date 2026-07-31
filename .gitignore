@@ -1,6 +1,9 @@
-# Dados brutos e processados
+# Dados brutos
 data/raw/*.csv
-data/processed/*
+
+# PERMITE a pasta processed para o GitHub carregar o Parquet
+!data/processed/
+!data/processed/*.parquet
 
 # Arquivos temporários do Python e Ambientes Virtuais
 __pycache__/
