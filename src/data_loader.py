@@ -96,19 +96,25 @@ def buscar_dados_online(anos: range) -> pd.DataFrame:
     pld_files, ear_files, ena_files, carga_files = [], [], [], []
 
     for ano in anos:
-        print(f"🌐 Baixando dados online do ano {ano}...")
+        print(f"🌐 Processando dados do ano {ano}...")
 
-        # PLD (Utiliza arquivo local como fonte do histórico de preços ou requisição)
+        # PLD - Carrega os arquivos locais existentes sem interromper se o ano atual não tiver CSV bruto
         caminho_pld_local = RAW_DATA_DIR / f'pld_horario_{ano}.csv'
         if caminho_pld_local.exists():
             pld_files.append(pd.read_csv(caminho_pld_local, sep=';'))
         else:
-            raise FileNotFoundError(f"Arquivo base de PLD local ({caminho_pld_local.name}) não encontrado.")
+            print(f"⚠️ Planilha local de PLD ({caminho_pld_local.name}) não encontrada. Pulando PLD deste ano...")
 
-        # ONS - Baixa diretamente da nuvem
-        ear_files.append(pd.read_csv(ONS_URLS['EAR'].format(ano=ano), sep=';'))
-        ena_files.append(pd.read_csv(ONS_URLS['ENA'].format(ano=ano), sep=';'))
-        carga_files.append(pd.read_csv(ONS_URLS['CARGA'].format(ano=ano), sep=';'))
+        # ONS - Baixa diretamente das URLs abertas
+        try:
+            ear_files.append(pd.read_csv(ONS_URLS['EAR'].format(ano=ano), sep=';'))
+            ena_files.append(pd.read_csv(ONS_URLS['ENA'].format(ano=ano), sep=';'))
+            carga_files.append(pd.read_csv(ONS_URLS['CARGA'].format(ano=ano), sep=';'))
+        except Exception as e_ons:
+            print(f"⚠️ Não foi possível baixar dados ONS para {ano}: {e_ons}")
+
+    if not pld_files:
+        raise FileNotFoundError("Nenhum arquivo histórico de PLD foi localizado em 'data/raw/'.")
 
     return processar_e_unificar_dfs(pld_files, ear_files, ena_files, carga_files)
 
