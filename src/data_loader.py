@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime
 import os
 import pandas as pd
 import requests
@@ -25,6 +26,12 @@ def limpar_numeros(series: pd.Series) -> pd.Series:
                 .str.replace(',', '.', regex=False)
                 .astype(float))
     return series
+
+
+def obter_intervalo_anos_padrao() -> range:
+    """Retorna o intervalo de anos do histórico desde 2021 até o ano atual."""
+    ano_atual = datetime.now().year
+    return range(2021, ano_atual + 1) # O '+ 1' garante que o ano atual seja INCLUÍDO
 
 
 def processar_e_unificar_dfs(pld_files: list, ear_files: list, ena_files: list, carga_files: list) -> pd.DataFrame:
@@ -123,23 +130,22 @@ def carregar_dados_locais_fallback(anos: range) -> pd.DataFrame:
     return processar_e_unificar_dfs(pld_files, ear_files, ena_files, carga_files)
 
 
-def carregar_e_unificar_dados(anos: range = range(2021, 2026)) -> pd.DataFrame:
+def carregar_e_unificar_dados(anos: range = None) -> pd.DataFrame:
     """
-    Estratégia API-First:
-    1. Tenta conectar e baixar os dados atualizados das APIs/URLs públicas.
-    2. Se tiver sucesso, salva a nova versão em Parquet para atualização do cache.
-    3. Em caso de erro de conexão, faz fallback para a base local.
+    Estratégia API-First com cálculo dinâmico de datas.
     """
+    if anos is None:
+        anos = obter_intervalo_anos_padrao()
+
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------------------------------
     # PRIMEIRA TENTATIVA: API / Download Online
     # -------------------------------------------------------------------------
     try:
-        print("📡 Conectando aos servidores da ONS/CCEE...")
+        print(f"📡 Conectando aos servidores da ONS/CCEE para o período {anos.start} a {anos.stop - 1}...")
         df_unificado = buscar_dados_online(anos)
 
-        # Salva a nova versão baixada no Parquet para servir de fallback nas próximas vezes
         try:
             df_unificado.to_parquet(PARQUET_PATH)
             print(f"✅ Dados online obtidos e cache atualizado em: {PARQUET_PATH}")
@@ -148,9 +154,6 @@ def carregar_e_unificar_dados(anos: range = range(2021, 2026)) -> pd.DataFrame:
 
         return df_unificado
 
-    # -------------------------------------------------------------------------
-    # FALLBACK: Se houver qualquer falha de rede/API
-    # -------------------------------------------------------------------------
     except Exception as e_online:
         print(f"⚠️ A conexão online com as APIs falhou: {e_online}")
         print("🔄 Ativando modo FALLBACK: Buscando base de dados armazenada localmente...")
