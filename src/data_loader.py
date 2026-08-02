@@ -1,24 +1,25 @@
+from pathlib import Path
+from datetime import datetime
+import os
 import pandas as pd
-import numpy as np
+import requests
 
-# ==============================================================================
-# CONFIGURAÇÕES E CONSTANTES GLOBAIS
-# ==============================================================================
-PISOS_REGULATORIOS = {
-    2021: 55.70,
-    2022: 55.70,
-    2023: 69.04,
-    2024: 61.07,
-    2025: 68.41,
-    2026: 71.10
+# Define diretórios base a partir da localização do script
+BASE_DIR = Path(__file__).resolve().parent.parent
+RAW_DATA_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"
+PARQUET_PATH = PROCESSED_DATA_DIR / "pld_historico.parquet"
+
+# Mapeamento das URLs públicas do ONS
+ONS_URLS = {
+    'EAR': 'https://dados.ons.org.br/dataset/ear-diario-subsistema/resource/EAR_DIARIO_SUBSISTEMA_{ano}.csv',
+    'ENA': 'https://dados.ons.org.br/dataset/ena-diario-subsistema/resource/ENA_DIARIO_SUBSISTEMA_{ano}.csv',
+    'CARGA': 'https://dados.ons.org.br/dataset/curva-carga-2/resource/CURVA_CARGA_{ano}.csv'
 }
 
 
 def limpar_numeros(series: pd.Series) -> pd.Series:
-    """
-    Trata a numeração brasileira de strings numéricas:
-    Remove pontos de milhar e substitui vírgulas por pontos decimais.
-    """
+    """Trata numeração brasileira (remove pontos de milhar, troca vírgula por ponto)."""
     if series.dtype == 'object':
         return (series.astype(str)
                 .str.replace('.', '', regex=False)
@@ -27,135 +28,146 @@ def limpar_numeros(series: pd.Series) -> pd.Series:
     return series
 
 
-def filtrar_por_subsistema(df: pd.DataFrame, colunas_candidatas: list, alvo: str) -> pd.DataFrame:
-    """
-    Filtra um DataFrame garantindo o isolamento do submercado/subsistema desejado.
-    """
-    for col in colunas_candidatas:
-        if col in df.columns:
-            mask = df[col].astype(str).str.upper().str.contains(alvo.upper(), na=False)
-            if mask.any():
-                return df[mask].copy()
-    return df
+def obter_intervalo_anos_padrao() -> range:
+    """Retorna o intervalo de anos do histórico desde 2021 até o ano atual."""
+    ano_atual = datetime.now().year
+    return range(2021, ano_atual + 1) # O '+ 1' garante que o ano atual seja INCLUÍDO
 
 
-def carregar_e_processar_dados(
-    subsistema_alvo: str = 'SUDESTE',
-    anos: list = None,
-    train_pct: float = 0.80,
-    val_pct: float = 0.10
-):
-    """
-    Executa o pipeline completo de ETL e Engenharia de Features.
+def processar_e_unificar_dfs(pld_files: list, ear_files: list, ena_files: list, carga_files: list) -> pd.DataFrame:
+    """Aplica tratamento de tipos, parsing de datas e merge entre os datasets."""
+    df_pld_raw = pd.concat(pld_files, ignore_index=True)
+    df_ear_raw = pd.concat(ear_files, ignore_index=True)
+    df_ena_raw = pd.concat(ena_files, ignore_index=True)
+    df_carga_raw = pd.concat(carga_files, ignore_index=True)
 
-    Retorna:
-        X_train, y_train, X_val, y_val, X_test, y_test (DataFrames/Series do Pandas)
+    # 1. PLD Horário
+    df_pld = pd.DataFrame({
+        'Data_Hora': pd.to_datetime({
+            'year': df_pld_raw['MES_REFERENCIA'] // 100,
+            'month': df_pld_raw['MES_REFERENCIA'] % 100,
+            'day': df_pld_raw['DIA'],
+            'hour': df_pld_raw['HORA']
+        }),
+        'PLD': limpar_numeros(df_pld_raw['PLD_HORA'])
+    }).set_index('Data_Hora')
+
+    # 2. EAR Diário
+    col_data_ear = 'ear_data' if 'ear_data' in df_ear_raw.columns else df_ear_raw.columns[0]
+    col_val_ear = 'ear_verif_subsistema_percentual' if 'ear_verif_subsistema_percentual' in df_ear_raw.columns else \
+    df_ear_raw.columns[-1]
+
+    df_ear = pd.DataFrame({
+        'Data_Hora': pd.to_datetime(df_ear_raw[col_data_ear], format='mixed'),
+        'EAR': limpar_numeros(df_ear_raw[col_val_ear])
+    }).drop_duplicates(subset=['Data_Hora']).set_index('Data_Hora')
+
+    # 3. ENA Diário
+    col_data_ena = 'ena_data' if 'ena_data' in df_ena_raw.columns else df_ena_raw.columns[0]
+    col_val_ena = 'ena_armazenavel_regiao_percentualmlt' if 'ena_armazenavel_regiao_percentualmlt' in df_ena_raw.columns else \
+    df_ena_raw.columns[-1]
+
+    df_ena = pd.DataFrame({
+        'Data_Hora': pd.to_datetime(df_ena_raw[col_data_ena], format='mixed'),
+        'ENA': limpar_numeros(df_ena_raw[col_val_ena])
+    }).drop_duplicates(subset=['Data_Hora']).set_index('Data_Hora')
+
+    # 4. Carga Horária
+    col_data_carga = 'din_instante' if 'din_instante' in df_carga_raw.columns else df_carga_raw.columns[0]
+    col_val_carga = 'val_cargaenergiahomwmed' if 'val_cargaenergiahomwmed' in df_carga_raw.columns else \
+    df_carga_raw.columns[-1]
+
+    df_carga_clean = df_carga_raw.copy()
+    df_carga_clean['Data_Hora'] = pd.to_datetime(df_carga_clean[col_data_carga], format='mixed')
+    df_carga_clean['CARGA'] = limpar_numeros(df_carga_clean[col_val_carga])
+    df_carga = df_carga_clean.groupby('Data_Hora')['CARGA'].mean().to_frame()
+
+    # 5. Merge e Interpolação Temporal
+    df_merged = df_pld.join([df_ear, df_ena, df_carga], how='outer').sort_index()
+    df_merged['EAR'] = df_merged['EAR'].ffill()
+    df_merged['ENA'] = df_merged['ENA'].ffill()
+    df_merged.dropna(subset=['PLD', 'CARGA'], inplace=True)
+
+    return df_merged
+
+
+def buscar_dados_online(anos: range) -> pd.DataFrame:
+    """Busca os dados online via URL pública com verificação de requisição."""
+    pld_files, ear_files, ena_files, carga_files = [], [], [], []
+
+    for ano in anos:
+        print(f"🌐 Processando dados do ano {ano}...")
+
+        # PLD - Carrega os arquivos locais existentes sem interromper se o ano atual não tiver CSV bruto
+        caminho_pld_local = RAW_DATA_DIR / f'pld_horario_{ano}.csv'
+        if caminho_pld_local.exists():
+            pld_files.append(pd.read_csv(caminho_pld_local, sep=';'))
+        else:
+            print(f"⚠️ Planilha local de PLD ({caminho_pld_local.name}) não encontrada. Pulando PLD deste ano...")
+
+        # ONS - Baixa diretamente das URLs abertas
+        try:
+            ear_files.append(pd.read_csv(ONS_URLS['EAR'].format(ano=ano), sep=';'))
+            ena_files.append(pd.read_csv(ONS_URLS['ENA'].format(ano=ano), sep=';'))
+            carga_files.append(pd.read_csv(ONS_URLS['CARGA'].format(ano=ano), sep=';'))
+        except Exception as e_ons:
+            print(f"⚠️ Não foi possível baixar dados ONS para {ano}: {e_ons}")
+
+    if not pld_files:
+        raise FileNotFoundError("Nenhum arquivo histórico de PLD foi localizado em 'data/raw/'.")
+
+    return processar_e_unificar_dfs(pld_files, ear_files, ena_files, carga_files)
+
+
+def carregar_dados_locais_fallback(anos: range) -> pd.DataFrame:
+    """Função de resgate para carregar os dados persistidos localmente."""
+    # 1. Tenta carregar a base consolidada Parquet
+    if PARQUET_PATH.exists():
+        print("📁 [FALLBACK] Carregando base salva em 'data/processed/pld_historico.parquet'...")
+        return pd.read_parquet(PARQUET_PATH)
+
+    # 2. Se não houver Parquet, tenta ler os CSVs brutos locais
+    print("📁 [FALLBACK] Parquet não encontrado. Processando a partir dos CSVs locais em 'data/raw'...")
+    pld_files = [pd.read_csv(RAW_DATA_DIR / f'pld_horario_{ano}.csv', sep=';') for ano in anos]
+    ear_files = [pd.read_csv(RAW_DATA_DIR / f'EAR_DIARIO_SUBSISTEMA_{ano}.csv', sep=';') for ano in anos]
+    ena_files = [pd.read_csv(RAW_DATA_DIR / f'ENA_DIARIO_SUBSISTEMA_{ano}.csv', sep=';') for ano in anos]
+    carga_files = [pd.read_csv(RAW_DATA_DIR / f'CURVA_CARGA_{ano}.csv', sep=';') for ano in anos]
+
+    return processar_e_unificar_dfs(pld_files, ear_files, ena_files, carga_files)
+
+
+def carregar_e_unificar_dados(anos: range = None) -> pd.DataFrame:
+    """
+    Estratégia API-First com cálculo dinâmico de datas.
     """
     if anos is None:
-        anos = ['2021', '2022', '2023', '2024', '2025', '2026']
+        anos = obter_intervalo_anos_padrao()
 
-    print(f"[ETL] Carregando bases de dados de {anos[0]} a {anos[-1]}...")
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Leitura dos Arquivos CSV
-    df_pld_raw = pd.concat([pd.read_csv(f'pld_horario_{ano}.csv', sep=';') for ano in anos], ignore_index=True)
-    df_ear_raw = pd.concat([pd.read_csv(f'EAR_DIARIO_SUBSISTEMA_{ano}.csv', sep=';') for ano in anos], ignore_index=True)
-    df_ena_raw = pd.concat([pd.read_csv(f'ENA_DIARIO_SUBSISTEMA_{ano}.csv', sep=';') for ano in anos], ignore_index=True)
-    df_carga_raw = pd.concat([pd.read_csv(f'CURVA_CARGA_{ano}.csv', sep=';') for ano in anos], ignore_index=True)
+    # -------------------------------------------------------------------------
+    # PRIMEIRA TENTATIVA: API / Download Online
+    # -------------------------------------------------------------------------
+    try:
+        print(f"📡 Conectando aos servidores da ONS/CCEE para o período {anos.start} a {anos.stop - 1}...")
+        df_unificado = buscar_dados_online(anos)
 
-    # 2. Filtragem por Submercado Regional
-    print(f"[ETL] Isolando submercado: {subsistema_alvo}...")
-    cols_sub = ['nom_subsistema', 'id_subsistema', 'submercado', 'nom_submercado']
+        try:
+            df_unificado.to_parquet(PARQUET_PATH)
+            print(f"✅ Dados online obtidos e cache atualizado em: {PARQUET_PATH}")
+        except Exception as e_save:
+            print(f"⚠️ Não foi possível atualizar o arquivo .parquet: {e_save}")
 
-    df_pld_sub = filtrar_por_subsistema(df_pld_raw, cols_sub, subsistema_alvo)
-    df_ear_sub = filtrar_por_subsistema(df_ear_raw, cols_sub, subsistema_alvo)
-    df_ena_sub = filtrar_por_subsistema(df_ena_raw, cols_sub, subsistema_alvo)
-    df_carga_sub = filtrar_por_subsistema(df_carga_raw, cols_sub, subsistema_alvo)
+        return df_unificado
 
-    # 3. Construção dos Índices Temporais (Tratando Formatos Mistos de Data)
-    df_pld = pd.DataFrame()
-    df_pld['Data_Hora'] = pd.to_datetime({
-        'year': df_pld_sub['MES_REFERENCIA'] // 100,
-        'month': df_pld_sub['MES_REFERENCIA'] % 100,
-        'day': df_pld_sub['DIA'],
-        'hour': df_pld_sub['HORA']
-    })
-    df_pld['PLD'] = df_pld_sub['PLD_HORA'].values
-    df_pld.set_index('Data_Hora', inplace=True)
+    except Exception as e_online:
+        print(f"⚠️ A conexão online com as APIs falhou: {e_online}")
+        print("🔄 Ativando modo FALLBACK: Buscando base de dados armazenada localmente...")
 
-    df_ear = pd.DataFrame()
-    df_ear['Data_Hora'] = pd.to_datetime(df_ear_sub['ear_data'], format='mixed', dayfirst=True)
-    df_ear['EAR'] = limpar_numeros(df_ear_sub['ear_verif_subsistema_percentual']).values
-    df_ear.set_index('Data_Hora', inplace=True)
-
-    df_ena = pd.DataFrame()
-    df_ena['Data_Hora'] = pd.to_datetime(df_ena_sub['ena_data'], format='mixed', dayfirst=True)
-    df_ena['ENA'] = limpar_numeros(df_ena_sub['ena_armazenavel_regiao_percentualmlt']).values
-    df_ena.set_index('Data_Hora', inplace=True)
-
-    df_carga = pd.DataFrame()
-    df_carga['Data_Hora'] = pd.to_datetime(df_carga_sub['din_instante'], format='mixed', dayfirst=True)
-    df_carga['CARGA'] = limpar_numeros(df_carga_sub['val_cargaenergiahomwmed']).values
-    df_carga.set_index('Data_Hora', inplace=True)
-
-    # Remoção de duplicidades de índice
-    df_pld = df_pld[~df_pld.index.duplicated(keep='first')]
-    df_ear = df_ear[~df_ear.index.duplicated(keep='first')]
-    df_ena = df_ena[~df_ena.index.duplicated(keep='first')]
-    df_carga = df_carga[~df_carga.index.duplicated(keep='first')]
-
-    # 4. Alinhamento em Grade Temporal Contínua e Blindagem de Vazamento
-    data_inicio = df_pld.index.min()
-    data_fim = df_pld.index.max()
-    grade_horaria = pd.date_range(start=data_inicio, end=data_fim, freq='h', name='Data_Hora')
-
-    df_xgb = pd.DataFrame(index=grade_horaria)
-    df_xgb = df_xgb.join(df_pld, how='left')
-    df_xgb = df_xgb.join(df_ear, how='left')
-    df_xgb = df_xgb.join(df_ena, how='left')
-    df_xgb = df_xgb.join(df_carga, how='left')
-
-    # Blindagem contra vazamento de dados:
-    # - ffill() em vez de interpolate() para proibir uso de dados do futuro.
-    # - shift(24) em EAR e ENA para refletir a defasagem real de publicação do ONS.
-    df_xgb['EAR'] = df_xgb['EAR'].ffill().shift(24)
-    df_xgb['ENA'] = df_xgb['ENA'].ffill().shift(24)
-    df_xgb['PLD'] = df_xgb['PLD'].ffill()
-    df_xgb['CARGA'] = df_xgb['CARGA'].ffill()
-
-    # 5. Engenharia de Features
-    print("[ETL] Gerando variáveis calendárias, lags e médias móveis...")
-
-    # A) Calendário
-    df_xgb['Hora'] = df_xgb.index.hour
-    df_xgb['Dia_da_Semana'] = df_xgb.index.dayofweek
-    df_xgb['Mes'] = df_xgb.index.month
-    df_xgb['Eh_Fim_de_Semana'] = df_xgb['Dia_da_Semana'].isin([5, 6]).astype(int)
-
-    # B) Lags Temporais
-    for lag in [1, 2, 3, 24, 168]:
-        df_xgb[f'PLD_lag_{lag}h'] = df_xgb['PLD'].shift(lag)
-        df_xgb[f'CARGA_lag_{lag}h'] = df_xgb['CARGA'].shift(lag)
-
-    # C) Médias Móveis
-    df_xgb['PLD_media_movel_24h'] = df_xgb['PLD'].shift(1).rolling(window=24).mean()
-    df_xgb['CARGA_media_movel_24h'] = df_xgb['CARGA'].shift(1).rolling(window=24).mean()
-
-    # D) Target: PLD da hora seguinte (t+1)
-    df_xgb['PLD_Target'] = df_xgb['PLD'].shift(-1)
-
-    # Limpeza final de NaNs gerados pelos atrasos/lags
-    df_xgb.dropna(inplace=True)
-
-    # 6. Separação de Matrizes e Divisão Cronológica Tríplice
-    X = df_xgb.drop(columns=['PLD_Target', 'CARGA'])
-    y = df_xgb['PLD_Target']
-
-    total_amostras = len(df_xgb)
-    idx_treino = int(total_amostras * train_pct)
-    idx_val = int(total_amostras * (train_pct + val_pct))
-
-    X_train, y_train = X.iloc[:idx_treino], y.iloc[:idx_treino]
-    X_val, y_val = X.iloc[idx_treino:idx_val], y.iloc[idx_treino:idx_val]
-    X_test, y_test = X.iloc[idx_val:], y.iloc[idx_val:]
-
-    return X_train, y_train, X_val, y_val, X_test, y_test
+        try:
+            return carregar_dados_locais_fallback(anos)
+        except Exception as e_local:
+            raise FileNotFoundError(
+                "❌ Erro Crítico: Não foi possível obter dados online (API fora do ar ou sem internet) "
+                "nem carregar os dados armazenados localmente."
+            ) from e_local
